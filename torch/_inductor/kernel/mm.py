@@ -934,23 +934,6 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
         mat2.get_dtype(),
         layout,
     )
-    if (not is_nonzero) or (
-        not (inductor_config.max_autotune or inductor_config.max_autotune_gemm)
-    ):
-        # TODO(coconutruben): combine this with the main flow of addmm through
-        # a subgraph or something as inp vs inp_expanded causes some slight numeric
-        # differences
-        kernel_inputs = MMKernelInputs(
-            [inp, mat1, mat2], scalars=dict(alpha=alpha, beta=beta)
-        )
-        choices.extend(
-            V.choices.get_template_configs(
-                kernel_inputs,
-                [aten_addmm],
-                name,
-            )
-        )
-        return autotune_select_algorithm(name, choices, kernel_inputs.nodes(), layout)
 
     # Collect all templates for unified call
     templates_to_use: list[Union[ExternKernelChoice, KernelTemplate]] = []
