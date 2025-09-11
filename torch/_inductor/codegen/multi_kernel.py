@@ -3,6 +3,7 @@ import functools
 import logging
 import os
 import pathlib
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from torch._inductor.ir import MultiTemplateBuffer
 from torch._inductor.metrics import get_metric_table, is_metric_table_enabled
@@ -13,7 +14,7 @@ from ..codecache import code_hash, CodeCacheFuture, get_path, write_atomic
 from ..runtime.benchmarking import benchmarker
 from ..utils import cache_on_self, IndentedBuffer
 from ..virtualized import V
-from .common import TensorArg, WorkspaceArg
+from .common import Kernel, TensorArg, WorkspaceArg
 
 
 log = logging.getLogger(__name__)
@@ -27,11 +28,11 @@ class MultiKernelState:
     V.graph.wrapper_code has a reference to MultiKernelState instance.
     """
 
-    def __init__(self):
-        self.subkernel_to_kernel_name = {}
-        self.kernel_defs = IndentedBuffer()
+    def __init__(self) -> None:
+        self.subkernel_to_kernel_name: Dict[Tuple[str, ...], str] = {}
+        self.kernel_defs: IndentedBuffer = IndentedBuffer()
 
-    def define_kernel(self, kernels):
+    def define_kernel(self, kernels: List[Kernel]) -> str:
         """
         Previously we name the multi kernel as "multi_kernel_{kernel_names[0]}".
         This has some minor issue.
@@ -124,11 +125,11 @@ class MultiKernel:
     Here is a concrete example: https://gist.github.com/shunting314/d9f3fb6bc6cee3dbae005825ca196d39
     """
 
-    def __init__(self, kernels):
+    def __init__(self, kernels: List[Kernel]) -> None:
         assert len(kernels) >= 2
 
-        self.kernels = kernels
-        self.kernel_name = V.graph.wrapper_code.multi_kernel_state.define_kernel(
+        self.kernels: Kernel = kernels
+        self.kernel_name: str = V.graph.wrapper_code.multi_kernel_state.define_kernel(
             kernels
         )
 
@@ -151,7 +152,7 @@ class MultiKernel:
         return [*result.values()]
 
     @staticmethod
-    def merge_workspaces_inplace(kernels):
+    def merge_workspaces_inplace(kernels: List[Kernel]) -> Optional[List[WorkspaceArg]]:
         if len(kernels) < 2:
             return
         # All kernels must share the same workspace
@@ -163,7 +164,7 @@ class MultiKernel:
             kernel.args.workspace_args = workspace_args
         return workspace_args
 
-    def call_kernel(self, kernel_name):
+    def call_kernel(self, kernel_name: str) -> None:
         """
         Collect the union of arguments from all subkernels as the arguments
         for the multi-kernel.
@@ -224,7 +225,7 @@ class MultiKernel:
         for ws in reversed(self.kernels[0].args.workspace_args):
             V.graph.wrapper_code.generate_workspace_deallocation(ws)
 
-    def codegen_nan_check(self):
+    def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code
         seen: OrderedSet[str] = OrderedSet()
         for k in self.kernels:
@@ -240,16 +241,16 @@ class MultiKernel:
                     wrapper.writeline(line)
 
     @property
-    def removed_buffers(self):
+    def removed_buffers(self) -> OrderedSet[str]:
         return OrderedSet.intersection(*[k.removed_buffers for k in self.kernels])
 
     @property
-    def inplaced_to_remove(self):
+    def inplaced_to_remove(self) -> OrderedSet[str]:
         return OrderedSet.intersection(*[k.inplaced_to_remove for k in self.kernels])
 
     @property
     @cache_on_self
-    def inplace_update_buffers(self):
+    def inplace_update_buffers(self) -> Dict[str, str]:
         """
         Make sure all kernels have the same inplace update mappings.
         """
@@ -257,7 +258,7 @@ class MultiKernel:
             assert k.inplace_update_buffers == self.kernels[0].inplace_update_buffers
         return self.kernels[0].inplace_update_buffers
 
-    def warn_mix_layout(self, kernel_name: str):
+    def warn_mix_layout(self, kernel_name: str) -> None:
         pass
 
 
@@ -266,35 +267,36 @@ class MultiKernelCall:
     This class is called at run time to actually run the kernel
     """
 
-    def __init__(self, multi_kernel_name, kernels, arg_index, shape_specialize=False):
+    def __init__(self, multi_kernel_name: str, kernels: List[Kernel], arg_index: Dict[int, List[slice]], shape_specialize: bool = False) -> None:
         assert len(kernels) >= 2
-        self._kernels = kernels
-        self.multi_kernel_name = multi_kernel_name
+        self._kernels: List[Kernel] = kernels
+        self.multi_kernel_name: str = multi_kernel_name
 
-        self.disable_cache = os.environ.get(
+        self.disable_cache: bool = os.environ.get(
             "TORCHINDUCTOR_DISABLE_MULTI_KERNEL_CACHE"
         ) == "1" or is_metric_table_enabled("persistent_red_perf")
 
-        self.picked_kernel = None
-        self.arg_index = arg_index
+        self.picked_kernel: Optional[int] = None
+        self.arg_index: Dict[int, List[slice]] = arg_index
         if config.triton.multi_kernel > 1:
             # manually force a subkernel to ease perf testing
-            picked_by_config = config.triton.multi_kernel - 2
+            picked_by_config: int = config.triton.multi_kernel - 2
             assert picked_by_config < len(self._kernels)
             self.picked_kernel = picked_by_config
         elif not self.disable_cache:
             self.load_cache()
 
-        self._recorded = False
+        self._recorded: bool = False
 
         # This means for each unique shape we will do a separate assessment
         # for which kernel is the best. This is particularly useful for matmul
         # kernels where the best kernel can vary based on very small differences
         # in shape.
-        self._shape_specialize = shape_specialize
-        self._shape_cache = {}
+        self._shape_specialize: bool = shape_specialize
+        # Maps tuple of inputs shapes -> chosen kernel index
+        self._shape_cache: Dict[Tuple[Tuple[int, ...], ...], int] = {}
 
-    def cache_file_path(self):
+    def cache_file_path(self) -> pathlib.Path:
         key = code_hash(
             ",".join(
                 [
@@ -306,7 +308,7 @@ class MultiKernelCall:
         _, _, path = get_path(key, "picked_kernel")
         return pathlib.Path(path)
 
-    def load_cache(self):
+    def load_cache(self) -> None:
         assert self.picked_kernel is None
         path = self.cache_file_path()
         if path.exists():
@@ -319,7 +321,7 @@ class MultiKernelCall:
                     "Load picked kernel %d from cache file %s", self.picked_kernel, path
                 )
 
-    def store_cache(self):
+    def store_cache(self) -> None:
         assert self.picked_kernel is not None
         path = self.cache_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,7 +330,7 @@ class MultiKernelCall:
         log.debug("Store picked kernel %d to cache file %s", self.picked_kernel, path)
 
     @property
-    def kernels(self):
+    def kernels(self) -> List[Kernel]:
         """
         Read results from future.
 
@@ -342,7 +344,7 @@ class MultiKernelCall:
 
         return self._kernels
 
-    def benchmark_sub_kernels(self, *args, **kwargs):
+    def benchmark_sub_kernels(self, *args: Any, **kwargs: Any) -> List[float]:
         """
         Benchmark all the sub kernels and return the execution time
         (in milliseconds) for each of time.
@@ -351,8 +353,8 @@ class MultiKernelCall:
         be picked.
         """
 
-        def wrap_fn(kernel, index):
-            def inner():
+        def wrap_fn(kernel: Any, index: int) -> Any:
+            def inner() -> Any:
                 filtered_args = self._get_filtered_args(args, index)
                 args_clone, kwargs_clone = kernel.clone_args(*filtered_args, **kwargs)
                 return kernel.run(*args_clone, **kwargs_clone)
@@ -364,7 +366,7 @@ class MultiKernelCall:
             for index, kernel in enumerate(self.kernels)
         ]
 
-    def _get_filtered_args(self, args, index):
+    def _get_filtered_args(self, args: Tuple[Any, ...], index: int) -> Iterable[Any]:
         """
         We pass in all arguments to all kernels into the MultiKernelCall
         so when invoking a particular kernel we need to filter to only the
@@ -388,7 +390,7 @@ class MultiKernelCall:
     # path for the cache file. Also reading the cache file need do some IO
     # which can be slower.
     @staticmethod
-    def record_choice(multi_kernel_name: str, picked_kernel_name: str):
+    def record_choice(multi_kernel_name: str, picked_kernel_name: str) -> None:
         """
         Record the multi-kernel choice for cpp-wrapper after autotuning
 
@@ -414,7 +416,7 @@ class MultiKernelCall:
         # there should be no miss
         return V.graph.multi_kernel_to_choice[multi_kernel_name]
 
-    def run(self, *args, **kwargs):
+    def run(self, *args: Any, **kwargs: Any) -> None:
         if self._shape_specialize:
             cache_key = self._get_shape_cache_key(*args, **kwargs)
             cached_choice = self._get_cached_shape_choice(cache_key)
